@@ -13,10 +13,9 @@ import re
 import time
 import uuid
 import os
-import sys
 from datetime import datetime
-from pathlib import Path
-from typing import List, Dict, Any, Optional
+from urllib.parse import urlencode
+from typing import List, Dict, Optional
 from dataclasses import dataclass, asdict
 
 # Colors for terminal output
@@ -64,7 +63,6 @@ def print_progress(message: str):
 @dataclass
 class VideoData:
     """Data class for video information"""
-    no: int
     video_id: str
     url: str
     username: str
@@ -85,10 +83,6 @@ class VideoData:
 class TikTokAPIScraper:
     def __init__(self, signature_server_url: str = "http://localhost:8080"):
         self.signature_server = signature_server_url
-
-    async def search_videos(self, keyword: str, max_videos: int = 30,
-                           progress_callback=None) -> List[VideoData]:
-        """Search TikTok videos menggunakan API"""
 
     @staticmethod
     def _looks_relevant(items: List[Dict], keyword: str) -> bool:
@@ -124,7 +118,7 @@ class TikTokAPIScraper:
                     "channel": "tiktok_web",
                 }
 
-                url = f"https://www.tiktok.com/api/search/general/full/?{'&'.join([f'{k}={v}' for k, v in params.items()])}"
+                url = f"https://www.tiktok.com/api/search/general/full/?{urlencode(params)}"
 
                 # TikTok menggilir hasil asli/hasil pengganti per-request di
                 # sesi tamu; halaman tak relevan diulang sampai dapat yang asli
@@ -161,7 +155,6 @@ class TikTokAPIScraper:
                 for item in items:
                     video = self._convert_to_video(item)
                     if video:
-                        video.no = len(videos) + 1
                         videos.append(video)
 
                 cursor = data.get("cursor", cursor + len(items))
@@ -405,8 +398,8 @@ class CLI:
             print(f"\n{Colors.BOLD}{Colors.YELLOW}📹 TOP RESULTS{Colors.END}")
             print(f"{Colors.GRAY}{'─' * 70}{Colors.END}")
 
-            for v in videos[:5]:
-                print(f"\n{Colors.BOLD}{v.no}. @{v.username}{Colors.END} {Colors.GRAY}({v.nickname}){Colors.END}")
+            for i, v in enumerate(videos[:5], 1):
+                print(f"\n{Colors.BOLD}{i}. @{v.username}{Colors.END} {Colors.GRAY}({v.nickname}){Colors.END}")
                 if v.caption:
                     caption = v.caption[:60] + "..." if len(v.caption) > 60 else v.caption
                     print(f"   {Colors.GRAY}📝{Colors.END} {caption}")

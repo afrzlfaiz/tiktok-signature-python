@@ -1,135 +1,88 @@
 # TikTok Signature API — Port Python
 
-Port Python dari [`carcabot/tiktok-signature`](https://github.com/carcabot/tiktok-signature) (Node.js): server yang menandatangani URL API TikTok dengan mengeksekusi SDK `webmssdk.js` TikTok di dalam Chromium headless, lalu mengembalikan URL bertanda tangan — atau mengambil datanya langsung sebagai proxy.
+Port Python dari [`carcabot/tiktok-signature`](https://github.com/carcabot/tiktok-signature) (Node.js): server yang menandatangani URL API TikTok dengan mengeksekusi SDK `webmssdk.js` TikTok di dalam Chromium headless. `X-Bogus`, `X-Gnarly`, `X-Dynosaur`, `msToken`, dan cookies dikelola server — klien tidak perlu tahu apa pun.
 
-**Tidak perlu** khawatir soal `X-Bogus`, `X-Gnarly`, `X-Dynosaur`, `msToken`, atau cookies: semua itu dikelola server di dalam browser.
+## Cara kerja
 
-```
-Klien ── POST /signature ──> Server (FastAPI + Playwright)
-Klien ── POST /fetch    ──>  └─ halaman nyata tiktok.com (headless)
-                              └─ SDK halaman menandatangani fetch sintetis
-                              └─ URL bertanda tangan → data kembali ke klien
-```
+Pendekatan lama "injeksi webmssdk.js versi vendor" sudah tidak kompatibel dengan bundle TikTok sekarang (SDK lama mematahkan penandatanganan — fetch sintetis jadi `X-Bogus=1`). Port ini memakai trik yang terbukti jalan di epoch sekarang:
 
-## Cara kerja (inti)
-
-Pendekatan lama "injeksi webmssdk.js versi vendor" **sudah tidak kompatibel** dengan bundle TikTok sekarang — SDK lama mematahkan penandatanganan (fetch sintetis jadi `X-Bogus=1`). Port ini memakai trik yang terbukti jalan di epoch sekarang:
-
-1. Browser memuat **halaman nyata** `tiktok.com` (mis. `@zara`), yang menyediakan cookies sesi + hook fetch/XHR halaman sendiri.
-2. `page.evaluate(fetch(url))` → hook SDK **halaman** menandatangani fetch sintetis (X-Bogus + X-Gnarly + X-Dynosaur + msToken).
-3. Request bertanda tangan itu ditangkap dengan `page.expect_request()` lalu **di-abort** (tidak ada traffic keluar) → URL bertanda tangan diekstrak.
-4. Param lingkungan (device_id, odinId, region, tz_name, browser_version, ~28 param lain) **diwarisi dari request API pertama halaman** — tanpa ini TikTok membalas `missing required fields`.
-5. `POST /fetch` = varian proxy: URL ditandatangani lalu **benar-benar dikirim** dari dalam halaman, body JSON dikembalikan — klien tak perlu memegang UA/cookies sama sekali.
-
-## Struktur
-
-```
-tiktok-signature-python/
-├── main.py            # server (FastAPI + Playwright async) — satu file
-├── scraper.py         # CLI pencarian TikTok (klien /fetch, export JSON/CSV/XLSX)
-├── test_cookies.py    # alat uji: cookie mana yang mengidentifikasi akun login
-└── requirements.txt   # fastapi, uvicorn, playwright, aiohttp (scraper)
-```
-
-## Instalasi
-
-```bash
-pip install -r requirements.txt
-playwright install chromium
-```
+1. Browser memuat **halaman nyata** `tiktok.com` (`INIT_URL`), yang menyediakan cookies sesi + hook fetch/XHR halaman.
+2. `page.evaluate(fetch(url))` → hook SDK **halaman** menandatangani fetch sintetis.
+3. Request bertanda tangan ditangkap (`page.expect_request`) lalu **di-abort** — tidak ada traffic keluar; URL bertanda tangan diekstrak.
+4. Param lingkungan (device_id, odinId, region, ~28 param lain) **diwarisi dari request API pertama halaman** — tanpa ini TikTok balas `missing required fields`.
+5. `POST /fetch` = proxy: URL ditandatangani lalu benar-benar dikirim dari dalam halaman; klien tidak perlu memegang UA/cookies.
 
 ## Menjalankan
 
 ```bash
+pip install -r requirements.txt
+playwright install chromium
 uvicorn main:app --port 8080
 ```
 
-Log `[Server] Browser siap: ...` berarti SDK + param lingkungan sudah tertangkap. Cek:
-
-```bash
-curl localhost:8080/health
-# {"status":"ok","ready":true,"signCount":0,"sessionAgeMinutes":0,
-#  "maxGenerationsBeforeRefresh":500,"maxSessionAgeMinutes":30.0}
-```
+Log `[Server] Browser siap: ...` berarti SDK + param lingkungan tertangkap. Cek `curl localhost:8080/health` → `{"status":"ok","ready":true,...}`.
 
 ## Endpoint
 
 | Endpoint | Deskripsi |
 |---|---|
 | `POST /signature` | `{"url": ...}` (atau string polos) → URL bertanda tangan + UA + cookies |
-| `POST /fetch` | `{"url": ...}` → kirim URL dari dalam browser, balas body JSON (`{"status":"ok","httpStatus":200,"data":{...}}`) |
+| `POST /fetch` | kirim URL dari dalam browser → body JSON (`{"status":"ok","httpStatus":200,"data":{...}}`) |
 | `GET /health` | status sesi browser |
 | `GET /restart` | recycle browser (SDK mati / sesi usang) |
 
-### Contoh `curl`
-
 ```bash
-# tanda tangan URL API
-curl -X POST localhost:8080/signature -H 'Content-Type: application/json' \
-  -d '{"url": "https://www.tiktok.com/api/recommend/item_list/?aid=1988&count=30"}'
-
-# ambil data langsung (paling praktis untuk skrip)
 curl -X POST localhost:8080/fetch -H 'Content-Type: application/json' \
   -d '{"url": "https://www.tiktok.com/api/search/general/full/?aid=1988&keyword=makanan&count=12&search_source=query&type=1&channel=tiktok_web"}'
 ```
 
-Respons `/signature`:
+## Struktur
 
-```json
-{"status": "ok", "data": {
-  "signedUrl": "https://www.tiktok.com/api/...&X-Bogus=...&msToken=...",
-  "xBogus": "...", "xGnarly": "...", "xDynosaur": "...",
-  "secUid": "", "cursor": "", "deviceId": "...",
-  "userAgent": "Mozilla/5.0 (Macintosh; ... Safari/605.1.15)",
-  "cookies": "ttwid=...; msToken=..."
-}}
+```
+main.py            # server (FastAPI + Playwright async) — satu file
+scraper.py         # CLI pencarian: klien /fetch + export JSON/CSV/XLSX
+test_cookies.py    # alat uji: cookie mana yang mengidentifikasi akun login
+requirements.txt
 ```
 
-## Klien Python
+## Klien
 
 ```python
 import aiohttp, asyncio
 
 async def search(keyword: str, count: int = 12):
-    url = ("https://www.tiktok.com/api/search/general/full/?"
-           f"aid=1988&keyword={keyword}&count={count}&cursor=0"
-           "&search_source=query&type=1&channel=tiktok_web")
+    url = (f"https://www.tiktok.com/api/search/general/full/?aid=1988&keyword={keyword}"
+           f"&count={count}&cursor=0&search_source=query&type=1&channel=tiktok_web")
     async with aiohttp.ClientSession() as s:
-        async with s.post("http://localhost:8080/fetch",
-                          json={"url": url}, timeout=aiohttp.ClientTimeout(total=60)) as r:
+        async with s.post("http://localhost:8080/fetch", json={"url": url},
+                          timeout=aiohttp.ClientTimeout(total=60)) as r:
             return await r.json()
 
 data = asyncio.run(search("makanan"))
-for entry in data["data"]["data"]:        # daftar {item: {...}}
-    v = entry["item"]
-    print(v["id"], v["desc"][:60], v["stats"]["playCount"])
+for entry in data["data"]["data"]:
+    print(entry["item"]["desc"][:60])
 ```
 
-Atau pakai CLI jadi-jadian `scraper.py` (pencarian + paginasi + export JSON/CSV/XLSX):
-
-```bash
-python3 scraper.py
-# masukkan keyword, jumlah video, pilih format export
-```
+Atau CLI jadi-jadian: `python3 scraper.py` (interaktif: keyword → jumlah video → format export).
 
 ## Sesi login (opsional)
 
-Server berjalan sebagai **tamu**. Untuk data yang butuh login (following, likes, history, profil privat):
+Server jalan sebagai **tamu**; data yang butuh login (following, likes, profil privat) memerlukan `sessionid`:
 
-- **`sessionid` saja sudah cukup mengidentifikasi akun** — diuji live: dengan `sessionid` saja, halaman masuk mode login dan `post/item_list` mengembalikan data nyata (tamu: 0 byte). `sessionid_ss`, `sid_tt`, dan hash di `sid_guard` adalah salinan nilai yang sama — redundan.
-- `ttwid`/`msToken` **tidak perlu disalin** — halaman men-generate sendiri yang segar.
+- **`sessionid` saja sudah cukup mengidentifikasi akun** (diuji live: feed masuk mode login dan `post/item_list` berisi data nyata; tamu: 0 byte). `sessionid_ss`, `sid_tt`, dan hash di `sid_guard` adalah salinan nilai yang sama — redundan.
+- `ttwid`/`msToken` **tidak perlu disalin** — halaman generate sendiri yang segar.
 - `passport_csrf_token`/`tt_csrf_token` wajib hanya untuk POST yang mengubah state (like, follow, comment).
-- Alat uji: `COOKIE_JAR="...;..." python3 test_cookies.py` — menampilkan subset mana yang masuk mode login (feed `story/user_list` berdata 14 KB vs tamu 0–104 byte).
+- Uji subset cookie mana yang masuk mode login: `COOKIE_JAR="...;..." python3 test_cookies.py`
 
 > ⚠️ `sessionid` adalah kredensial penuh. Jangan sebarkan; rotasi lewat *Settings → Security → log out perangkat lain* bila bocor.
 
 ## Batasan yang diketahui
 
-- **Guest-gate TikTok**: `post/item_list` (video profil) mengembalikan `200` dengan **0 byte** untuk sesi tamu — semua jalur (in-page maupun eksternal). Ini pembatasan akun, bukan cacat pipeline. Login (sessionid) menyelesaikannya.
-- **Hasil pencarian pengganti**: sesi tamu kadang diberi feed fallback yang tak relevan (mis. konten bola untuk kata kunci "makanan"), dan hasilnya bergilir per-request. `scraper.py` menanganinya dengan retry halaman yang tak relevan (maks. 3×).
-- **Fetch eksternal diblokir**: URL bertanda tangan yang di-fetch dari luar browser (requests/aiohttp) kini dibalas `200`/0-byte untuk tamu — gunakan `POST /fetch` (dari dalam browser) sebagai gantinya.
-- **macOS Python SSL**: `certificate verify failed` saat fetch eksternal → `pip install certifi` (atau pakai `/fetch`).
-- **Refresh otomatis**: browser di-recycle tiap 500 sign atau 30 menit (konstanta di `main.py`).
+- **Guest-gate**: `post/item_list` (video profil) balas `200` dengan 0 byte untuk sesi tamu — pembatasan akun, bukan cacat pipeline. Login menyelesaikannya.
+- **Hasil pengganti**: sesi tamu kadang diberi feed fallback yang tak relevan, bergilir per-request; `scraper.py` menanganinya dengan retry halaman tak relevan (maks. 3×).
+- **Fetch eksternal diblokir**: URL bertanda tangan yang di-fetch dari luar browser balas `200`/0-byte untuk tamu — pakai `POST /fetch`.
+- **macOS Python SSL**: `certificate verify failed` saat fetch eksternal → `pip install certifi`.
+- **Refresh otomatis**: browser di-recycle tiap `MAX_SIGS_BEFORE_REFRESH` (500) sign atau `MAX_SESSION_AGE_S` (1800 s).
 
 ## Konfigurasi (konstanta di `main.py`)
 

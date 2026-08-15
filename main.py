@@ -286,17 +286,25 @@ def parse_body(request_body) -> str:
     return ""
 
 
-@app.post("/signature")
-async def signature_endpoint(request: Request):
+async def get_target(request: Request):
+    """Body request → URL target + validasi (shared /signature & /fetch)."""
     try:
         body = await request.json()
     except Exception:
         body = {}
-    target_url = parse_body(body)
-    if not target_url:
-        return JSONResponse({"status": "error", "message": "URL is required"}, status_code=400)
+    url = parse_body(body)
+    if not url:
+        return "", JSONResponse({"status": "error", "message": "URL is required"}, status_code=400)
     if not state["ready"]:
-        return JSONResponse({"status": "error", "message": "Browser belum siap"}, status_code=500)
+        return "", JSONResponse({"status": "error", "message": "Browser belum siap"}, status_code=500)
+    return url, None
+
+
+@app.post("/signature")
+async def signature_endpoint(request: Request):
+    target_url, error = await get_target(request)
+    if error:
+        return error
 
     try:
         result = await generate_signature(target_url)
@@ -320,20 +328,13 @@ async def fetch_endpoint(request: Request):
     benar-benar dikirim (tidak di-abort) dan body JSON-nya dikembalikan.
     Fallback '100% reliable' gaya repo asli — dipakai skrip yang butuh
     respons langsung (mis. pencarian)."""
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    target_url = parse_body(body)
-    if not target_url:
-        return JSONResponse({"status": "error", "message": "URL is required"}, status_code=400)
-    if not state["ready"]:
-        return JSONResponse({"status": "error", "message": "Browser belum siap"}, status_code=500)
+    target_url, error = await get_target(request)
+    if error:
+        return error
 
     async with sign_lock:
         page = state["page"]
         cleaned = prepare_url(target_url)
-        route_state["armed"] = False  # fetch harus benar-benar keluar jaringan
         try:
             result = await asyncio.wait_for(
                 page.evaluate(
