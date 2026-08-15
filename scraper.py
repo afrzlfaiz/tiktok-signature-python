@@ -204,7 +204,6 @@ class TikTokAPIScraper:
         music_title = music.get("title", "") if isinstance(music, dict) else ""
 
         return VideoData(
-            no=0,
             video_id=str(video_id),
             url=f"https://www.tiktok.com/@{username}/video/{video_id}" if username else "",
             username=username,
