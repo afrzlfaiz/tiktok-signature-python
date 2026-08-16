@@ -47,13 +47,13 @@ Porting ini menggunakan mekanisme modern yang teruji:
 
 ```mermaid
 graph TD
-    Client[Klien Scraping / App] -->|1. POST /fetch {url}| FastAPI[FastAPI Signature Server]
-    FastAPI -->|2. Inject fetch synthetic| Page[Chromium Headless Page]
-    Page -->|3. Trigger webmssdk.js| SDK[TikTok Web SDK]
-    SDK -->|4. Generate X-Bogus & msToken| Request[Signed Request]
-    Page -->|5. Intercept & Abort / Proxy Fetch| Request
-    Request -->|6. Execution Result Data| FastAPI
-    FastAPI -->|7. JSON Response| Client
+    Client["Klien Scraping / App"] -->|"1. POST /fetch (URL)"| FastAPI["FastAPI Signature Server"]
+    FastAPI -->|"2. Inject synthetic fetch"| Page["Chromium Headless Page"]
+    Page -->|"3. Trigger webmssdk.js"| SDK["TikTok Web SDK"]
+    SDK -->|"4. Generate X-Bogus & msToken"| Request["Signed Request"]
+    Page -->|"5. Intercept & Abort / Proxy Fetch"| Request
+    Request -->|"6. Execution Result Data"| FastAPI
+    FastAPI -->|"7. JSON Response"| Client
 ```
 
 ---
