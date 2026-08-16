@@ -8,7 +8,7 @@
 
 Server penandatangan (*signature engine*) API TikTok berbasis Python (Porting dari [`carcabot/tiktok-signature`](https://github.com/carcabot/tiktok-signature) Node.js). 
 
-Server ini secara otomatis mengeksekusi SDK `webmssdk.js` resmi TikTok di dalam Chromium Headless untuk meng-generate token `X-Bogus`, `X-Gnarly`, `X-Dynosaur`, `msToken`, dan mengelola cookies sesi—sehingga klien (*scrapers*) dapat melakukan request API TikTok tanpa perlu menjalankan browser sendiri.
+Server ini secara otomatis mengeksekusi SDK `webmssdk.js` resmi TikTok di dalam Chromium Headless untuk meng-generate token `X-Bogus`, `X-Gnarly`, `X-Dynosaur`, `msToken`, dan mengelola cookies sesi guest.
 
 ---
 
@@ -20,9 +20,7 @@ Server ini secara otomatis mengeksekusi SDK `webmssdk.js` resmi TikTok di dalam 
   - [`GET /health`](#1-get-health)
   - [`POST /signature`](#2-post-signature)
   - [`POST /fetch`](#3-post-fetch)
-  - [`GET /restart`](#4-get-restart)
-- [Contoh Kode Klien](#-contoh-kode-klien)
-- [Penggunaan Sesi Login (Opsional)](#-penggunaan-sesi-login-opsional)
+  - [`POST /restart`](#4-post-restart)
 - [Struktur Project](#-struktur-project)
 - [Tabel Konfigurasi](#-tabel-konfigurasi)
 - [Batasan & Troubleshooting](#-batasan--troubleshooting)
@@ -76,7 +74,8 @@ python -m uvicorn main:app --port 8080
 Saat log terminal menunjukkan `[Server] Browser siap`, verifikasi status dengan:
 ```bash
 curl http://localhost:8080/health
-# Output: {"status":"ok","ready":true,"sign_count":0,...}
+# Output saat siap: {"status":"ok","ready":true,"signCount":0,...}
+# HTTP 503 dikembalikan selama browser belum siap.
 ```
 
 ---
@@ -86,13 +85,15 @@ curl http://localhost:8080/health
 ### 1. `GET /health`
 Mengecek apakah instance browser Playwright siap menerima request penandatanganan.
 
-* **Response (`200 OK`)**:
+* **Response (`200 OK` saat siap, `503` saat belum siap)**:
   ```json
   {
     "status": "ok",
     "ready": true,
-    "sign_count": 12,
-    "session_age_s": 145
+    "signCount": 12,
+    "sessionAgeMinutes": 2,
+    "maxGenerationsBeforeRefresh": 500,
+    "maxSessionAgeMinutes": 30.0
   }
   ```
 
@@ -111,9 +112,11 @@ Menandatangani URL API TikTok tanpa mengeksekusi HTTP request-nya. Mengembalikan
   ```json
   {
     "status": "ok",
-    "signed_url": "https://www.tiktok.com/api/search/general/full/?aid=1988&keyword=kuliner&count=12&X-Bogus=DFSzswVY...",
-    "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)...",
-    "cookies": "ttwid=1%7C...;"
+    "data": {
+      "signedUrl": "https://www.tiktok.com/api/search/general/full/?aid=1988&keyword=kuliner&count=12&X-Bogus=DFSzswVY...",
+      "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)...",
+      "cookies": "ttwid=1%7C...;"
+    }
   }
   ```
 
@@ -137,7 +140,7 @@ Menandatangani URL sekaligus mengeksekusi fetch secara langsung dari dalam brows
 
 ---
 
-### 4. `GET /restart`
+### 4. `POST /restart`
 Merefresh / mendaur ulang instance browser Playwright secara manual jika sesi usang atau SDK bermasalah.
 
 * **Response (`200 OK`)**:
@@ -150,56 +153,19 @@ Merefresh / mendaur ulang instance browser Playwright secara manual jika sesi us
 
 ---
 
-## 💻 Contoh Kode Klien
+## 🔐 Keamanan dan konfigurasi akses
 
-Contoh penggunaan service dari aplikasi Python menggunakan `aiohttp`:
+Target `/signature` dan `/fetch` dibatasi ke URL HTTPS API TikTok. Server berjalan guest-only; mekanisme memasukkan cookie login berada di luar scope proyek.
 
-```python
-import asyncio
-import aiohttp
+Secara default API hanya dapat dipakai secara lokal dan CORS dinonaktifkan. Jika perlu mengekspos API melalui jaringan, gunakan token bearer:
 
-async def fetch_tiktok_search(keyword: str, count: int = 12):
-    search_url = (
-        f"https://www.tiktok.com/api/search/general/full/"
-        f"?aid=1988&keyword={keyword}&count={count}&cursor=0&search_source=query&type=1&channel=tiktok_web"
-    )
-    
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            "http://localhost:8080/fetch",
-            json={"url": search_url},
-            timeout=aiohttp.ClientTimeout(total=60)
-        ) as response:
-            return await response.json()
-
-# Jalankan async function
-data = asyncio.run(fetch_tiktok_search("kuliner jakarta"))
-
-if data.get("status") == "ok":
-    items = data["data"].get("data", [])
-    for item in items:
-        video_desc = item.get("item", {}).get("desc", "")
-        print(f"📌 {video_desc[:60]}...")
+```bash
+SIGNATURE_API_TOKEN="ganti-dengan-token-kuat" \
+SIGNATURE_CORS_ORIGINS="https://app.example.com" \
+python -m uvicorn main:app --port 8080
 ```
 
-> 💡 **CLI bawaan**: Tersedia juga script CLI pengetesan interaktif via [`scraper.py`](file:///Users/mac/Documents/Python/GITHUB/tiktok-signature-python/scraper.py): `python scraper.py`.
-
----
-
-## 🔐 Penggunaannya Sesi Login (Opsional)
-
-Secara default, server berjalan dalam mode **Guest (Tamu)**. Untuk mengakses data yang memerlukan autentikasi (seperti daftar *following*, *likes*, atau profil privat):
-
-> [!WARNING]
-> **Penting tentang Keamanan `sessionid`**  
-> String `sessionid` merupakan kredensial akses penuh akun Anda. Jaga kerahasiaannya dan jangan di-commit ke repositori publik!
-
-1. Ambil nilai cookie `sessionid` dari browser setelah login ke TikTok Web.
-2. Cukup masukkan cookie `sessionid` tersebut saat menginisialisasi sesi (cookie `ttwid` dan `msToken` akan digenerate secara otomatis oleh server).
-3. Anda dapat menguji kecocokan cookie dengan script pembantu:
-   ```bash
-   COOKIE_JAR="sessionid=xxxxxxx..." python test_cookies.py
-   ```
+Kirim token sebagai header `Authorization: Bearer <token>` pada `/signature`, `/fetch`, dan `/restart`. Jangan mengaktifkan akses publik tanpa autentikasi dan rate limit di reverse proxy.
 
 ---
 
@@ -208,8 +174,6 @@ Secara default, server berjalan dalam mode **Guest (Tamu)**. Untuk mengakses dat
 ```text
 tiktok-signature-python/
 ├── main.py            # Entrypoint FastAPI server (Playwright async engine)
-├── scraper.py         # Script CLI testing (klien /fetch + export data)
-├── test_cookies.py    # Script pengujian cookie sesi login
 ├── requirements.txt   # Dependency Python (fastapi, uvicorn, playwright)
 ├── README.md          # Dokumentasi teknis proyek
 └── .gitignore         # Rules git ignore
@@ -219,15 +183,17 @@ tiktok-signature-python/
 
 ## ⚙️ Tabel Konfigurasi
 
-Variabel konfigurasi utama pada [`main.py`](file:///Users/mac/Documents/Python/GITHUB/tiktok-signature-python/main.py):
+Variabel konfigurasi utama pada [`main.py`](main.py):
 
 | Parameter | Nilai Default | Keterangan |
 | :--- | :--- | :--- |
 | `DEFAULT_UA` | Safari macOS (Intel) | User-Agent yang dikunci untuk pembuatan signature |
-| `INIT_URL` | `tiktok.com/@zara` | Halaman nyata untuk menginisialisasi hook SDK & cookies |
+| `INIT_URL` | `tiktok.com/@zara` | Halaman nyata untuk menginisialisasi hook SDK & cookies guest |
 | `MAX_SIGS_BEFORE_REFRESH` | `500` | Batas maksimum penandatanganan sebelum browser di-recycle |
 | `MAX_SESSION_AGE_S` | `1800` (30 menit) | Umur maksimum sesi browser sebelum di-recycle otomatis |
 | `SIGN_TIMEOUT_MS` | `8000` (8 detik) | Timeout maksimal menunggu penandatanganan URL |
+| `SIGNATURE_API_TOKEN` | kosong | Token bearer opsional untuk endpoint mutasi |
+| `SIGNATURE_CORS_ORIGINS` | kosong | Daftar origin CORS, dipisahkan koma |
 
 ---
 
@@ -235,11 +201,11 @@ Variabel konfigurasi utama pada [`main.py`](file:///Users/mac/Documents/Python/G
 
 > [!NOTE]
 > **Pembatasan Mode Guest (Guest-Gate)**  
-> Endpoint seperti `post/item_list` (video profil) mengembalikan HTTP 200 dengan 0 byte data pada sesi Guest. Ini adalah kebijakan pembatasan dari TikTok. Gunakan cookie `sessionid` jika membutuhkan data tersebut.
+> Endpoint TikTok tertentu memang membatasi data pada sesi Guest. Proyek ini tidak mengelola cookie login.
 
 > [!TIP]
-> **Pencarian Memberikan Hasil Pengganti (Fallback Feed)**  
-> Sesi tamu terkadang diberi feed fallback secara acak oleh TikTok. Modul `scraper.py` menangani hal ini dengan melakukan retry otomatis hingga 3 kali.
+> **Scope proyek**
+> Proyek ini hanya menyediakan signature server dan proxy fetch; pengambilan serta pengolahan data menjadi tanggung jawab klien.
 
 > [!IMPORTANT]
 > **Error SSL Certificate di macOS**  

@@ -1,5 +1,3 @@
 fastapi
 uvicorn
 playwright
-aiohttp
-# openpyxl — opsional, hanya untuk export Excel di scraper.py

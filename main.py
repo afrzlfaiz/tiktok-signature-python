@@ -14,10 +14,11 @@ Klien WAJIB memakai user_agent + cookies dari respons saat fetch ke TikTok.
 """
 
 import asyncio
+import hmac
 import json
+import os
 import time
 from contextlib import asynccontextmanager
-from pathlib import Path
 from urllib.parse import urlsplit, parse_qs, parse_qsl, urlencode
 
 import uvicorn
@@ -34,6 +35,13 @@ DEFAULT_UA = (
 )
 
 INIT_URL = "https://www.tiktok.com/@zara"  # halaman nyata: cookies + hook SDK
+ALLOWED_TIKTOK_HOSTS = {"tiktok.com", "www.tiktok.com"}
+API_TOKEN = os.getenv("SIGNATURE_API_TOKEN", "").strip()
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("SIGNATURE_CORS_ORIGINS", "").split(",")
+    if origin.strip()
+]
 MAX_SIGS_BEFORE_REFRESH = 500
 MAX_SESSION_AGE_S = 1800
 SIGN_TIMEOUT_MS = 8000
@@ -101,73 +109,109 @@ async def route_handler(route):
 
 async def init_browser():
     """Launch Chromium headless dan siapkan halaman TikTok yang hidup."""
+    if state["browser"] or state["playwright"]:
+        await close_browser()
+
     playwright = await async_playwright().start()
-    browser = await playwright.chromium.launch(
-        headless=True,
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--window-size=1920,1080",
-            "--no-sandbox",
-        ],
-    )
-    context = await browser.new_context(user_agent=DEFAULT_UA, viewport={"width": 1920, "height": 1080})
-    await context.add_init_script(INIT_SCRIPT)
-    page = await context.new_page()
-    await page.route("**/*", route_handler)  # satu-satunya route — dipasang sekali
-
-    state.update(playwright=playwright, browser=browser, context=context, page=page, ready=False)
-    route_state["armed"] = False
-    route_state["env_captured"] = False
-
-    # Saat init tidak ada yang di-abort: aborting request selama load membuat
-    # SPA mandek (render menggantung menunggu API yang di-abort). Load pertama
-    # tidak bisa diandalkan — selalu reload.
-    await page.goto(INIT_URL, wait_until="domcontentloaded")
-    await asyncio.sleep(3)
-    await page.reload(wait_until="domcontentloaded")
-
-    # Poll SDK + tangkapan param lingkungan; fallback: halaman depan yang
-    # pasti memicu request API bertanda tangan.
-    async def page_is_ready():
-        if not route_state["env_captured"]:
-            return False
-        return await page.evaluate(
-            "typeof window.byted_acrawler === 'object' && typeof window.byted_acrawler.frontierSign === 'function'"
+    browser = None
+    try:
+        browser = await playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--window-size=1920,1080",
+            ],
         )
+        context = await browser.new_context(user_agent=DEFAULT_UA, viewport={"width": 1920, "height": 1080})
+        await context.add_init_script(INIT_SCRIPT)
+        page = await context.new_page()
+        await page.route("**/*", route_handler)  # satu-satunya route — dipasang sekali
 
-    ready = False
-    for _ in range(20):
-        ready = await page_is_ready()
-        if ready:
-            break
-        await asyncio.sleep(1)
-    if not ready:
-        await page.goto("https://www.tiktok.com/", wait_until="domcontentloaded")
-        await asyncio.sleep(4)
-        for _ in range(15):
+        state.update(playwright=playwright, browser=browser, context=context, page=page, ready=False)
+        route_state["armed"] = False
+        route_state["env_captured"] = False
+
+        # Saat init tidak ada yang di-abort: aborting request selama load membuat
+        # SPA mandek (render menggantung menunggu API yang di-abort). Load pertama
+        # tidak bisa diandalkan — selalu reload.
+        await page.goto(INIT_URL, wait_until="domcontentloaded")
+        await asyncio.sleep(3)
+        await page.reload(wait_until="domcontentloaded")
+
+        # Poll SDK + tangkapan param lingkungan; fallback: halaman depan yang
+        # pasti memicu request API bertanda tangan.
+        async def page_is_ready():
+            if not route_state["env_captured"]:
+                return False
+            return await page.evaluate(
+                "typeof window.byted_acrawler === 'object' && typeof window.byted_acrawler.frontierSign === 'function'"
+            )
+
+        ready = False
+        for _ in range(20):
             ready = await page_is_ready()
             if ready:
                 break
             await asyncio.sleep(1)
-    if not ready:
-        await browser.close()
-        raise RuntimeError("SDK TikTok / param lingkungan tidak siap — coba lagi atau cek jaringan")
+        if not ready:
+            await page.goto("https://www.tiktok.com/", wait_until="domcontentloaded")
+            await asyncio.sleep(4)
+            for _ in range(15):
+                ready = await page_is_ready()
+                if ready:
+                    break
+                await asyncio.sleep(1)
+        if not ready:
+            raise RuntimeError("SDK TikTok / param lingkungan tidak siap — coba lagi atau cek jaringan")
 
-    state["ready"] = True
-    state["sign_count"] = 0
-    state["last_init"] = time.time()
-    print("[Server] Browser siap: SDK terpasang, %d param lingkungan tertangkap." % len(state["env_params"]))
+        state["ready"] = True
+        state["sign_count"] = 0
+        state["last_init"] = time.time()
+        print("[Server] Browser siap: SDK terpasang, %d param lingkungan tertangkap." % len(state["env_params"]))
+    except Exception:
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        try:
+            await playwright.stop()
+        except Exception:
+            pass
+        state.update(playwright=None, browser=None, context=None, page=None, ready=False, env_params={})
+        route_state.update(armed=False, env_captured=False)
+        raise
 
 
 async def close_browser():
-    if state["browser"]:
+    browser = state["browser"]
+    playwright = state["playwright"]
+    state.update(playwright=None, browser=None, context=None, page=None, ready=False, env_params={})
+    route_state.update(armed=False, env_captured=False)
+
+    if browser:
         try:
-            await state["browser"].close()
+            await browser.close()
         except Exception:
             pass
-    if state["playwright"]:
-        await state["playwright"].stop()
-    state.update(playwright=None, browser=None, context=None, page=None, ready=False)
+    if playwright:
+        try:
+            await playwright.stop()
+        except Exception:
+            pass
+
+
+async def ensure_browser_locked():
+    """Pastikan browser siap; caller wajib sudah memegang sign_lock."""
+    if not state["ready"] or not state["page"]:
+        await init_browser()
+        return
+
+    age = time.time() - state["last_init"]
+    if state["sign_count"] >= MAX_SIGS_BEFORE_REFRESH or age >= MAX_SESSION_AGE_S:
+        print(f"[Server] Refresh browser ({state['sign_count']} sign, {age:.0f}s)")
+        await close_browser()
+        await init_browser()
 
 
 def prepare_url(raw_url: str) -> str:
@@ -209,54 +253,48 @@ async def get_cookie_string() -> str:
     return "; ".join(f"{c['name']}={c['value']}" for c in cookie_list)
 
 
-async def generate_signature(target_url: str) -> dict:
-    """Satu siklus sign. Dijalankan dalam sign_lock — tanpa lock, dua fetch
-    sintetis bersamaan bisa tertukar predikat expect_request-nya."""
-    async with sign_lock:
-        now = time.time()
-        age = now - state["last_init"]
-        if (
-            state["sign_count"] >= MAX_SIGS_BEFORE_REFRESH
-            or age >= MAX_SESSION_AGE_S
-        ):
-            print(f"[Server] Refresh browser ({state['sign_count']} sign, {age:.0f}s)")
-            await close_browser()
-            await init_browser()
-
-        page = state["page"]
-        cleaned = prepare_url(target_url)
-        route_state["armed"] = True
+async def _generate_signature_locked(target_url: str) -> dict:
+    await ensure_browser_locked()
+    page = state["page"]
+    cleaned = prepare_url(target_url)
+    route_state["armed"] = True
+    try:
         try:
-            try:
-                async with page.expect_request(
-                    make_predicate(cleaned), timeout=SIGN_TIMEOUT_MS
-                ) as request_info:
-                    await page.evaluate(
-                        "(url) => fetch(url, { method: 'GET', credentials: 'include', headers: { Accept: '*/*' } }).catch(() => {})",
-                        cleaned,
-                    )
-                request_obj = await request_info.value
-                signed_url = request_obj.url
-            except PlaywrightTimeoutError as exc:
-                raise RuntimeError(
-                    "Timeout menunggu URL bertanda tangan — SDK/epoch sesi mati"
-                ) from exc
-        finally:
-            route_state["armed"] = False
+            async with page.expect_request(
+                make_predicate(cleaned), timeout=SIGN_TIMEOUT_MS
+            ) as request_info:
+                await page.evaluate(
+                    "(url) => fetch(url, { method: 'GET', credentials: 'include', headers: { Accept: '*/*' } }).catch(() => {})",
+                    cleaned,
+                )
+            request_obj = await request_info.value
+            signed_url = request_obj.url
+        except PlaywrightTimeoutError as exc:
+            raise RuntimeError(
+                "Timeout menunggu URL bertanda tangan — SDK/epoch sesi mati"
+            ) from exc
+    finally:
+        route_state["armed"] = False
 
-        state["sign_count"] += 1
-        params = parse_qs(urlsplit(signed_url).query)
-        return {
-            "signedUrl": signed_url,
-            "xBogus": params.get("X-Bogus", [""])[0],
-            "xGnarly": params.get("X-Gnarly", [""])[0],
-            "xDynosaur": params.get("X-Dynosaur", [""])[0],
-            "secUid": params.get("secUid", [""])[0],
-            "cursor": params.get("cursor", [""])[0],
-            "deviceId": params.get("device_id", [""])[0],
-            "userAgent": DEFAULT_UA,
-            "cookies": await get_cookie_string(),
-        }
+    state["sign_count"] += 1
+    params = parse_qs(urlsplit(signed_url).query)
+    return {
+        "signedUrl": signed_url,
+        "xBogus": params.get("X-Bogus", [""])[0],
+        "xGnarly": params.get("X-Gnarly", [""])[0],
+        "xDynosaur": params.get("X-Dynosaur", [""])[0],
+        "secUid": params.get("secUid", [""])[0],
+        "cursor": params.get("cursor", [""])[0],
+        "deviceId": params.get("device_id", [""])[0],
+        "userAgent": DEFAULT_UA,
+        "cookies": await get_cookie_string(),
+    }
+
+
+async def generate_signature(target_url: str) -> dict:
+    """Satu siklus sign; serialisasi diperlukan karena page hanya satu."""
+    async with sign_lock:
+        return await _generate_signature_locked(target_url)
 
 
 @asynccontextmanager
@@ -270,34 +308,79 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="TikTok Signature API (Python Port)", lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+if CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ORIGINS,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
 
 
 def parse_body(request_body) -> str:
     if isinstance(request_body, str):
-        return request_body
+        return request_body.strip()
     if isinstance(request_body, dict):
-        return request_body.get("url", "")
+        url = request_body.get("url", "")
+        return url.strip() if isinstance(url, str) else ""
     return ""
+
+
+def require_api_token(request: Request):
+    if not API_TOKEN:
+        return None
+
+    scheme, _, token = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "bearer" or not hmac.compare_digest(token, API_TOKEN):
+        return JSONResponse(
+            {"status": "error", "message": "Unauthorized"},
+            status_code=401,
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return None
+
+
+def validate_target_url(raw_url: str):
+    """Terima hanya URL HTTPS API TikTok; target bebas adalah blind proxy."""
+    try:
+        parts = urlsplit(raw_url)
+        hostname = parts.hostname
+        port = parts.port
+    except (AttributeError, ValueError):
+        return "", "Invalid URL"
+
+    if (
+        parts.scheme.lower() != "https"
+        or hostname is None
+        or hostname.lower().rstrip(".") not in ALLOWED_TIKTOK_HOSTS
+        or port not in (None, 443)
+        or parts.username is not None
+        or parts.password is not None
+        or not parts.path.startswith("/api/")
+        or parts.fragment
+    ):
+        return "", "Only HTTPS TikTok API URLs are allowed"
+    return raw_url, None
 
 
 async def get_target(request: Request):
     """Body request → URL target + validasi (shared /signature & /fetch)."""
+    auth_error = require_api_token(request)
+    if auth_error:
+        return "", auth_error
+
     try:
         body = await request.json()
     except Exception:
         body = {}
-    url = parse_body(body)
-    if not url:
+    raw_url = parse_body(body)
+    if not raw_url:
         return "", JSONResponse({"status": "error", "message": "URL is required"}, status_code=400)
-    if not state["ready"]:
-        return "", JSONResponse({"status": "error", "message": "Browser belum siap"}, status_code=500)
-    return url, None
+
+    target_url, validation_error = validate_target_url(raw_url)
+    if validation_error:
+        return "", JSONResponse({"status": "error", "message": validation_error}, status_code=400)
+    return target_url, None
 
 
 @app.post("/signature")
@@ -312,12 +395,14 @@ async def signature_endpoint(request: Request):
         print(f"[Server] Sign gagal: {exc}")
         # SDK bisa mati di tengah sesi — recycle sekali lalu retry (pola repo asli)
         try:
-            await close_browser()
-            await init_browser()
-            result = await generate_signature(target_url)
+            async with sign_lock:
+                await close_browser()
+                await init_browser()
+                result = await _generate_signature_locked(target_url)
         except Exception as retry_exc:
+            print(f"[Server] Retry sign gagal: {retry_exc}")
             return JSONResponse(
-                {"status": "error", "message": str(retry_exc)}, status_code=500
+                {"status": "error", "message": "Signature server unavailable"}, status_code=503
             )
     return {"status": "ok", "data": result}
 
@@ -333,47 +418,100 @@ async def fetch_endpoint(request: Request):
         return error
 
     async with sign_lock:
-        page = state["page"]
-        cleaned = prepare_url(target_url)
-        try:
-            result = await asyncio.wait_for(
-                page.evaluate(
-                    """(url) => fetch(url, { method: 'GET', credentials: 'include', headers: { Accept: 'application/json' } })
-                        .then(async r => ({ status: r.status, body: await r.text() }))
-                        .catch(e => ({ status: 0, body: String(e) }))""",
-                    cleaned,
-                ),
-                timeout=45,
-            )
-        except asyncio.TimeoutError:
-            return JSONResponse({"status": "error", "message": "Fetch timeout"}, status_code=504)
+        for attempt in range(2):
+            try:
+                await ensure_browser_locked()
+                page = state["page"]
+                cleaned = prepare_url(target_url)
+                result = await asyncio.wait_for(
+                    page.evaluate(
+                        """(url) => fetch(url, { method: 'GET', credentials: 'include', headers: { Accept: 'application/json' } })
+                            .then(async r => ({ status: r.status, body: await r.text() }))
+                            .catch(e => ({ status: 0, body: String(e) }))""",
+                        cleaned,
+                    ),
+                    timeout=45,
+                )
+                state["sign_count"] += 1
+                break
+            except asyncio.TimeoutError:
+                if attempt:
+                    return JSONResponse({"status": "error", "message": "Fetch timeout"}, status_code=504)
+                print("[Server] Fetch timeout; recycle browser lalu retry")
+            except Exception as exc:
+                if attempt:
+                    print(f"[Server] Fetch gagal setelah retry: {exc}")
+                    return JSONResponse(
+                        {"status": "error", "message": "Signature server unavailable"}, status_code=503
+                    )
+                print(f"[Server] Fetch gagal; recycle browser lalu retry: {exc}")
+
+            try:
+                await close_browser()
+                await init_browser()
+            except Exception as exc:
+                print(f"[Server] Recycle fetch gagal: {exc}")
+                return JSONResponse(
+                    {"status": "error", "message": "Signature server unavailable"}, status_code=503
+                )
+
+    if not isinstance(result, dict):
+        return JSONResponse({"status": "error", "message": "Invalid browser response"}, status_code=502)
 
     try:
-        data = json.loads(result["body"]) if result["body"] else None
+        http_status = int(result.get("status", 0) or 0)
+    except (TypeError, ValueError):
+        http_status = 0
+    if http_status <= 0:
+        return JSONResponse(
+            {"status": "error", "message": "TikTok request failed", "httpStatus": http_status},
+            status_code=502,
+        )
+
+    body = result.get("body", "")
+    try:
+        data = json.loads(body) if isinstance(body, str) and body else None
     except ValueError:
         data = None
-    return {"status": "ok", "httpStatus": result["status"], "data": data}
+
+    if not 200 <= http_status < 300:
+        error_status = http_status if 400 <= http_status <= 599 else 502
+        return JSONResponse(
+            {"status": "error", "httpStatus": http_status, "data": data},
+            status_code=error_status,
+        )
+    return {"status": "ok", "httpStatus": http_status, "data": data}
 
 
 @app.get("/health")
 async def health():
     age = (time.time() - state["last_init"]) if state["last_init"] else 0
-    return {
-        "status": "ok",
-        "ready": state["ready"],
+    ready = bool(state["ready"] and state["page"])
+    payload = {
+        "status": "ok" if ready else "starting",
+        "ready": ready,
         "signCount": state["sign_count"],
         "sessionAgeMinutes": round(age / 60),
         "maxGenerationsBeforeRefresh": MAX_SIGS_BEFORE_REFRESH,
         "maxSessionAgeMinutes": MAX_SESSION_AGE_S / 60,
     }
+    return JSONResponse(payload, status_code=200 if ready else 503)
 
 
-@app.get("/restart")
-async def restart():
-    async with sign_lock:
-        await close_browser()
-        await init_browser()
-    return {"status": "ok"}
+@app.post("/restart")
+async def restart(request: Request):
+    auth_error = require_api_token(request)
+    if auth_error:
+        return auth_error
+
+    try:
+        async with sign_lock:
+            await close_browser()
+            await init_browser()
+    except Exception as exc:
+        print(f"[Server] Restart gagal: {exc}")
+        return JSONResponse({"status": "error", "message": "Browser restart failed"}, status_code=503)
+    return {"status": "ok", "message": "Browser restarted"}
 
 
 if __name__ == "__main__":
